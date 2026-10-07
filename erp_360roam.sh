@@ -1,0 +1,11 @@
+python rotate_erp.py /mnt/disk4t/shaun/360roam-label/bar/ /mnt/disk4t/shaun/360roam-label/bar-rotated/ --pole bottom --device cuda
+python rotate_erp.py /mnt/disk4t/shaun/360roam-label/base/ /mnt/disk4t/shaun/360roam-label/base-rotated/ --pole bottom --device cuda
+python rotate_erp.py /mnt/disk4t/shaun/360roam-label/cafe/ /mnt/disk4t/shaun/360roam-label/cafe-rotated/ --pole bottom --device cuda
+python rotate_erp.py /mnt/disk4t/shaun/360roam-label/canteen/ /mnt/disk4t/shaun/360roam-label/canteen-rotated/ --pole bottom --device cuda
+python rotate_erp.py /mnt/disk4t/shaun/360roam-label/center/ /mnt/disk4t/shaun/360roam-label/center-rotated/ --pole bottom --device cuda
+python rotate_erp.py /mnt/disk4t/shaun/360roam-label/center1/ /mnt/disk4t/shaun/360roam-label/center1-rotated/ --pole bottom --device cuda
+python rotate_erp.py /mnt/disk4t/shaun/360roam-label/corridor/ /mnt/disk4t/shaun/360roam-label/corridor-rotated/ --pole bottom --device cuda
+python rotate_erp.py /mnt/disk4t/shaun/360roam-label/innovation/ /mnt/disk4t/shaun/360roam-label/innovation-rotated/ --pole bottom --device cuda
+python rotate_erp.py /mnt/disk4t/shaun/360roam-label/lab/ /mnt/disk4t/shaun/360roam-label/lab-rotated/ --pole bottom --device cuda
+python rotate_erp.py /mnt/disk4t/shaun/360roam-label/library/ /mnt/disk4t/shaun/360roam-label/library-rotated/ --pole bottom --device cuda
+python rotate_erp.py /mnt/disk4t/shaun/360roam-label/office/ /mnt/disk4t/shaun/360roam-label/office-rotated/ --pole bottom --device cuda

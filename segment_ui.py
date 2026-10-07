@@ -8,8 +8,10 @@ from matplotlib.backends.backend_qt5agg import FigureCanvasQTAgg as FigureCanvas
 from matplotlib.figure import Figure
 from PIL import Image
 from PyQt5.QtWidgets import (QApplication, QMainWindow, QPushButton, QVBoxLayout, QHBoxLayout, 
-                             QLabel, QLineEdit, QWidget, QFileDialog, QSpinBox, QGroupBox, QRadioButton)
-from PyQt5.QtCore import QTimer
+                             QLabel, QLineEdit, QWidget, QFileDialog, QSpinBox, QGroupBox, QRadioButton,
+                             QCheckBox, QShortcut)
+from PyQt5.QtCore import Qt, QTimer
+from PyQt5.QtGui import QKeySequence
 from sam2.build_sam import build_sam2_video_predictor
 
 
@@ -124,9 +126,9 @@ class SAM2AnnotationTool(QMainWindow):
         frame_layout = QVBoxLayout()
         
         frame_buttons = QHBoxLayout()
-        self.prev_button = QPushButton("Previous Frame")
+        self.prev_button = QPushButton("Previous Frame (r)")
         self.prev_button.clicked.connect(self.prev_frame)
-        self.next_button = QPushButton("Next Frame")
+        self.next_button = QPushButton("Next Frame (f)")
         self.next_button.clicked.connect(self.next_frame)
         frame_buttons.addWidget(self.prev_button)
         frame_buttons.addWidget(self.next_button)
@@ -190,7 +192,7 @@ class SAM2AnnotationTool(QMainWindow):
         annotation_layout.addLayout(point_mode_layout)
         
         # Add point button
-        self.add_point_button = QPushButton("Add Point")
+        self.add_point_button = QPushButton("Add Point (a)")
         self.add_point_button.clicked.connect(self.enable_point_selection)
         annotation_layout.addWidget(self.add_point_button)
         
@@ -215,13 +217,24 @@ class SAM2AnnotationTool(QMainWindow):
         segment_group = QGroupBox("Segmentation")
         segment_layout = QVBoxLayout()
         
-        self.segment_current_button = QPushButton("Segment Current Frame")
+        self.segment_current_button = QPushButton("Segment Current Frame (s)")
         self.segment_current_button.clicked.connect(self.segment_current_frame)
         segment_layout.addWidget(self.segment_current_button)
         
         self.segment_all_button = QPushButton("Segment All Frames")
         self.segment_all_button.clicked.connect(self.segment_all_frames)
         segment_layout.addWidget(self.segment_all_button)
+        
+        self.segment_current_obj_all_button = QPushButton("Segment Current Object in All Frames")
+        self.segment_current_obj_all_button.clicked.connect(self.segment_current_object_all_frames)
+        segment_layout.addWidget(self.segment_current_obj_all_button)
+        
+        self.forward_only_checkbox = QCheckBox("Only segment forward from current frame")
+        self.forward_only_checkbox.setToolTip(
+            "Propagate only from the current frame to the last frame. "
+            "Masks already computed for earlier frames are kept."
+        )
+        segment_layout.addWidget(self.forward_only_checkbox)
         
         segment_group.setLayout(segment_layout)
         left_layout.addWidget(segment_group)
@@ -233,6 +246,14 @@ class SAM2AnnotationTool(QMainWindow):
         self.save_button = QPushButton("Save Masks")
         self.save_button.clicked.connect(self.save_masks)
         save_layout.addWidget(self.save_button)
+        
+        self.save_binary_button = QPushButton("Save Binary Masks")
+        self.save_binary_button.clicked.connect(self.save_binary_masks)
+        save_layout.addWidget(self.save_binary_button)
+        
+        self.save_current_obj_binary_button = QPushButton("Save Current Object Binary Masks")
+        self.save_current_obj_binary_button.clicked.connect(self.save_current_obj_binary_masks)
+        save_layout.addWidget(self.save_current_obj_binary_button)
         
         save_group.setLayout(save_layout)
         left_layout.addWidget(save_group)
@@ -255,6 +276,12 @@ class SAM2AnnotationTool(QMainWindow):
         
         main_widget.setLayout(main_layout)
         self.setCentralWidget(main_widget)
+        
+        # Keyboard shortcuts
+        QShortcut(QKeySequence(Qt.Key_R), self).activated.connect(self.prev_frame)
+        QShortcut(QKeySequence(Qt.Key_F), self).activated.connect(self.next_frame)
+        QShortcut(QKeySequence(Qt.Key_A), self).activated.connect(self.enable_point_selection)
+        QShortcut(QKeySequence(Qt.Key_S), self).activated.connect(self.segment_current_frame)
         
         # Initialize UI state
         self.update_ui_state()
@@ -293,10 +320,15 @@ class SAM2AnnotationTool(QMainWindow):
         # Update segmentation controls
         self.segment_current_button.setEnabled(annotation_enabled and has_annotations)
         self.segment_all_button.setEnabled(annotation_enabled and has_annotations)
+        self.segment_current_obj_all_button.setEnabled(annotation_enabled and has_annotations)
+        self.forward_only_checkbox.setEnabled(annotation_enabled)
         
         # Update save controls
         has_segments = len(self.video_segments) > 0
+        has_current_obj_segments = any(self.ann_obj_id in obj_masks for obj_masks in self.video_segments.values())
         self.save_button.setEnabled(has_segments and not self.animation_playing)
+        self.save_binary_button.setEnabled(has_segments and not self.animation_playing)
+        self.save_current_obj_binary_button.setEnabled(has_current_obj_segments and not self.animation_playing)
     
     def update_object_id(self):
         self.ann_obj_id = self.obj_id_spinbox.value()
@@ -606,40 +638,57 @@ class SAM2AnnotationTool(QMainWindow):
         
         self.update_ui_state()
     
+    def _segment_object(self, obj_id):
+        """Run SAM2 inference for a single object on the current frame."""
+        prompts = self.object_prompts[obj_id].get(self.current_frame_idx, None)
+        if prompts is None:
+            return False
+        self.segmented_objects.add(obj_id)
+        if prompts['box'] is None and len(prompts['points']) == 0:
+            return False
+        
+        # Apply segmentation
+        points_array = np.array(prompts['points'], dtype=np.float32) if prompts['points'] else None
+        labels_array = np.array(prompts['labels'], dtype=np.int32) if prompts['labels'] else None
+        
+        _, out_obj_ids, out_mask_logits = self.predictor.add_new_points_or_box(
+            inference_state=self.inference_state,
+            frame_idx=self.current_frame_idx,
+            obj_id=obj_id,
+            points=points_array,
+            labels=labels_array,
+            box=prompts['box'],
+        )
+        
+        # Map client obj_id to the index in the returned logits tensor
+        obj_idx = out_obj_ids.index(obj_id)
+        mask = (out_mask_logits[obj_idx] > 0.0).cpu().numpy()
+        if mask.ndim > 2:
+            mask = mask.squeeze()
+            if mask.ndim == 1:
+                mask = mask[np.newaxis, :]
+        if self.current_frame_idx not in self.video_segments:
+            self.video_segments[self.current_frame_idx] = {}
+        self.video_segments[self.current_frame_idx][obj_id] = mask
+        return True
+    
     def segment_current_frame(self):
         if not self.inference_state or not self.object_prompts:
             return
         
         try:
-            for obj_id, prompts in self.object_prompts.items():
-                if self.current_frame_idx not in prompts:
-                    continue
+            if self.ann_obj_id in self.object_prompts:
+                if self._segment_object(self.ann_obj_id):
+                    self.display_current_frame()
+                    self.status_label.setText(
+                        f"Segmentation completed for object {self.ann_obj_id} in frame {self.current_frame_idx}"
+                    )
                 else:
-                    prompts = prompts[self.current_frame_idx]
-                self.segmented_objects.add(obj_id)
-                if prompts['box'] is None and len(prompts['points']) == 0:
-                    continue
-                # Apply segmentation
-                points_array = np.array(prompts['points'], dtype=np.float32) if prompts['points'] else None
-                labels_array = np.array(prompts['labels'], dtype=np.int32) if prompts['labels'] else None
-                
-                _, out_obj_ids, out_mask_logits = self.predictor.add_new_points_or_box(
-                    inference_state=self.inference_state,
-                    frame_idx=self.current_frame_idx,
-                    obj_id=obj_id,
-                    points=points_array,
-                    labels=labels_array,
-                    box=prompts['box'],
-                )
-            
-                # Store and display the result
-                mask = (out_mask_logits[obj_id] > 0.0).cpu().numpy()
-                if self.current_frame_idx not in self.video_segments:
-                    self.video_segments[self.current_frame_idx] = {}
-                self.video_segments[self.current_frame_idx][obj_id] = mask
-            
-            self.display_current_frame()
-            self.status_label.setText(f"Segmentation completed in frame {self.current_frame_idx}")
+                    self.status_label.setText(
+                        f"No prompts for object {self.ann_obj_id} in frame {self.current_frame_idx}"
+                    )
+            else:
+                self.status_label.setText(f"Object {self.ann_obj_id} has no prompts")
             
         except Exception as e:
             self.status_label.setText(f"Segmentation error: {str(e)}")
@@ -650,27 +699,183 @@ class SAM2AnnotationTool(QMainWindow):
         if not self.inference_state or not self.object_prompts:
             return
         
-        self.segment_current_frame()
-        
-        # Then propagate to all frames
-        self.status_label.setText("Propagating segmentation to all frames...")
-        QApplication.processEvents()  # Update UI
-        
-        self.video_segments = {}  # Reset segments
-        for out_frame_idx, out_obj_ids, out_mask_logits in self.predictor.propagate_in_video(self.inference_state):
-            self.video_segments[out_frame_idx] = {
-                out_obj_id: (out_mask_logits[i] > 0.0).cpu().numpy()
-                for i, out_obj_id in enumerate(out_obj_ids)
-            }
+        try:
+            # First, add prompts for all objects on the current frame
+            segmented_any = False
+            for obj_id in self.object_prompts:
+                if self._segment_object(obj_id):
+                    segmented_any = True
             
-            # Update UI occasionally to show progress
-            if out_frame_idx % 10 == 0:
-                self.status_label.setText(f"Processed frame {out_frame_idx}/{len(self.frame_names)}")
-                QApplication.processEvents()
-        
-        self.status_label.setText(f"Segmentation completed for all {len(self.frame_names)} frames")
-        self.display_current_frame()
+            if not segmented_any:
+                self.status_label.setText("No prompts to propagate")
+                return
             
+            forward_only = self.forward_only_checkbox.isChecked()
+            start_frame_idx = self.current_frame_idx if forward_only else None
+            
+            # Then propagate to all frames (or only forward from the current frame)
+            if forward_only:
+                self.status_label.setText(
+                    f"Propagating segmentation from frame {start_frame_idx} to the end..."
+                )
+                # Keep masks already computed for earlier frames
+                self.video_segments = {
+                    frame_idx: obj_masks
+                    for frame_idx, obj_masks in self.video_segments.items()
+                    if frame_idx < start_frame_idx
+                }
+            else:
+                self.status_label.setText("Propagating segmentation to all frames...")
+                self.video_segments = {}  # Reset segments
+            QApplication.processEvents()  # Update UI
+            
+            for out_frame_idx, out_obj_ids, out_mask_logits in self.predictor.propagate_in_video(
+                self.inference_state, start_frame_idx=start_frame_idx
+            ):
+                self.video_segments[out_frame_idx] = {}
+                for i, out_obj_id in enumerate(out_obj_ids):
+                    mask = (out_mask_logits[i] > 0.0).cpu().numpy()
+                    if mask.ndim > 2:
+                        mask = mask.squeeze()
+                        if mask.ndim == 1:
+                            mask = mask[np.newaxis, :]
+                    self.video_segments[out_frame_idx][out_obj_id] = mask
+                
+                # Update UI occasionally to show progress
+                if out_frame_idx % 10 == 0:
+                    self.status_label.setText(f"Processed frame {out_frame_idx}/{len(self.frame_names)}")
+                    QApplication.processEvents()
+            
+            if forward_only:
+                self.status_label.setText(
+                    f"Segmentation completed for frames {start_frame_idx}-{len(self.frame_names) - 1}"
+                )
+            else:
+                self.status_label.setText(f"Segmentation completed for all {len(self.frame_names)} frames")
+            self.display_current_frame()
+            
+        except Exception as e:
+            self.status_label.setText(f"Segmentation error: {str(e)}")
+        
+        self.update_ui_state()
+    
+    def segment_current_object_all_frames(self):
+        """Propagate only the current active object to all frames."""
+        if not self.inference_state or self.ann_obj_id not in self.object_prompts:
+            return
+        
+        current_obj_id = self.ann_obj_id
+        current_prompts = self.object_prompts[current_obj_id]
+        
+        forward_only = self.forward_only_checkbox.isChecked()
+        start_frame_idx = self.current_frame_idx if forward_only else None
+        
+        # Check if current object has any prompts within the propagation range
+        has_prompt = False
+        for frame_idx, prompts in current_prompts.items():
+            if forward_only and frame_idx < start_frame_idx:
+                continue
+            if prompts['box'] is not None or len(prompts['points']) > 0:
+                has_prompt = True
+                break
+        
+        if not has_prompt:
+            if forward_only:
+                self.status_label.setText(
+                    f"Object {current_obj_id} has no prompts at or after frame {start_frame_idx}"
+                )
+            else:
+                self.status_label.setText(f"Object {current_obj_id} has no prompts")
+            return
+        
+        try:
+            # Save masks we must restore after propagation: other objects everywhere,
+            # plus the current object on frames before the propagation start
+            saved_video_segments = {}
+            for frame_idx, obj_masks in self.video_segments.items():
+                saved_other_masks = {}
+                for obj_id, mask in obj_masks.items():
+                    if obj_id != current_obj_id:
+                        saved_other_masks[obj_id] = mask.copy()
+                    elif forward_only and frame_idx < start_frame_idx:
+                        saved_other_masks[obj_id] = mask.copy()
+                if saved_other_masks:
+                    saved_video_segments[frame_idx] = saved_other_masks
+            
+            # Reset predictor state and re-add only current object
+            self.predictor.reset_state(self.inference_state)
+            
+            # Add all prompts for the current object (only within the propagation range)
+            for frame_idx, prompts in current_prompts.items():
+                if forward_only and frame_idx < start_frame_idx:
+                    continue
+                if prompts['box'] is None and len(prompts['points']) == 0:
+                    continue
+                points_array = np.array(prompts['points'], dtype=np.float32) if prompts['points'] else None
+                labels_array = np.array(prompts['labels'], dtype=np.int32) if prompts['labels'] else None
+                
+                self.predictor.add_new_points_or_box(
+                    inference_state=self.inference_state,
+                    frame_idx=frame_idx,
+                    obj_id=current_obj_id,
+                    points=points_array,
+                    labels=labels_array,
+                    box=prompts['box'],
+                )
+            
+            # Propagate current object to all frames (or only forward from the current frame)
+            if forward_only:
+                self.status_label.setText(
+                    f"Propagating object {current_obj_id} from frame {start_frame_idx} to the end..."
+                )
+                # Keep masks already computed for earlier frames
+                self.video_segments = {
+                    frame_idx: obj_masks
+                    for frame_idx, obj_masks in self.video_segments.items()
+                    if frame_idx < start_frame_idx
+                }
+            else:
+                self.status_label.setText(f"Propagating object {current_obj_id} to all frames...")
+                self.video_segments = {}
+            QApplication.processEvents()
+            
+            for out_frame_idx, out_obj_ids, out_mask_logits in self.predictor.propagate_in_video(
+                self.inference_state, start_frame_idx=start_frame_idx
+            ):
+                self.video_segments[out_frame_idx] = {}
+                for i, out_obj_id in enumerate(out_obj_ids):
+                    mask = (out_mask_logits[i] > 0.0).cpu().numpy()
+                    if mask.ndim > 2:
+                        mask = mask.squeeze()
+                        if mask.ndim == 1:
+                            mask = mask[np.newaxis, :]
+                    self.video_segments[out_frame_idx][out_obj_id] = mask
+                
+                if out_frame_idx % 10 == 0:
+                    self.status_label.setText(f"Processed frame {out_frame_idx}/{len(self.frame_names)}")
+                    QApplication.processEvents()
+            
+            # Merge saved masks back into video_segments
+            for frame_idx, obj_masks in saved_video_segments.items():
+                if frame_idx not in self.video_segments:
+                    self.video_segments[frame_idx] = {}
+                for obj_id, mask in obj_masks.items():
+                    self.video_segments[frame_idx][obj_id] = mask
+            
+            if forward_only:
+                self.status_label.setText(
+                    f"Segmentation completed for object {current_obj_id} in frames "
+                    f"{start_frame_idx}-{len(self.frame_names) - 1}"
+                )
+            else:
+                self.status_label.setText(
+                    f"Segmentation completed for object {current_obj_id} in all {len(self.frame_names)} frames"
+                )
+            self.display_current_frame()
+            
+        except Exception as e:
+            self.status_label.setText(f"Segmentation error: {str(e)}")
+        
         self.update_ui_state()
     
     def save_masks(self):
@@ -724,7 +929,86 @@ class SAM2AnnotationTool(QMainWindow):
                 QApplication.processEvents()
         
         self.status_label.setText(f"Saved {saved_count} masks to {save_dir}")
+    
+    def save_binary_masks(self):
+        if not self.video_segments:
+            return
+        
+        # Get save path
+        subfolder = self.save_path_input.text().strip()
+        if not subfolder:
+            subfolder = "masks"
+        
+        # Create save directory in parent of data_dir
+        parent_dir = os.path.dirname(os.path.normpath(self.data_dir))
+        binary_save_dir = os.path.join(parent_dir, f"{subfolder}")
+        os.makedirs(binary_save_dir, exist_ok=True)
+        
+        saved_count = 0
+        for frame_idx, obj_masks in self.video_segments.items():
+            frame_name = os.path.splitext(self.frame_names[frame_idx])[0]
+            for obj_id, mask in obj_masks.items():
+                mask = np.asarray(mask)
+                if mask.ndim > 2:
+                    mask = mask.squeeze()
+                    if mask.ndim == 1:
+                        mask = mask[np.newaxis, :]
+                if mask.ndim != 2:
+                    print(f"Warning: unexpected mask shape for frame {frame_idx}, obj {obj_id}: {mask.shape}")
+                    continue
+                binary_mask = (mask.astype(np.uint8)) * 255
+                save_path = os.path.join(binary_save_dir, f"{frame_name}_obj_{obj_id}.png")
+                Image.fromarray(binary_mask).save(save_path)
+                saved_count += 1
             
+            # Periodically update UI to show progress
+            if saved_count % 20 == 0:
+                self.status_label.setText(f"Saved {saved_count} binary masks...")
+                QApplication.processEvents()
+        
+        self.status_label.setText(f"Saved {saved_count} binary masks to {binary_save_dir}")
+    
+    def save_current_obj_binary_masks(self):
+        if not self.video_segments:
+            return
+        
+        # Get save path
+        subfolder = self.save_path_input.text().strip()
+        if not subfolder:
+            subfolder = "masks"
+        
+        # Create save directory in parent of data_dir
+        parent_dir = os.path.dirname(os.path.normpath(self.data_dir))
+        binary_save_dir = os.path.join(parent_dir, f"{subfolder}")
+        os.makedirs(binary_save_dir, exist_ok=True)
+        
+        current_obj_id = self.ann_obj_id
+        saved_count = 0
+        for frame_idx, obj_masks in self.video_segments.items():
+            if current_obj_id not in obj_masks:
+                continue
+            frame_name = os.path.splitext(self.frame_names[frame_idx])[0]
+            mask = obj_masks[current_obj_id]
+            mask = np.asarray(mask)
+            if mask.ndim > 2:
+                mask = mask.squeeze()
+                if mask.ndim == 1:
+                    mask = mask[np.newaxis, :]
+            if mask.ndim != 2:
+                print(f"Warning: unexpected mask shape for frame {frame_idx}, obj {current_obj_id}: {mask.shape}")
+                continue
+            binary_mask = (mask.astype(np.uint8)) * 255
+            save_path = os.path.join(binary_save_dir, f"{frame_name}_obj_{current_obj_id}.png")
+            Image.fromarray(binary_mask).save(save_path)
+            saved_count += 1
+            
+            # Periodically update UI to show progress
+            if saved_count % 20 == 0:
+                self.status_label.setText(f"Saved {saved_count} binary masks for object {current_obj_id}...")
+                QApplication.processEvents()
+        
+        self.status_label.setText(f"Saved {saved_count} binary masks for object {current_obj_id} to {binary_save_dir}")
+    
     
     # Helper functions to display masks, points, and boxes
     def show_mask(self, mask, ax, obj_id=None, random_color=False):

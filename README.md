@@ -44,6 +44,10 @@ Here is a [demo video](./use_case.mp4).
 #### Segmentation
 - **Segment Current Frame**: Generate mask for current frame only
 - **Segment All Frames**: Propagate segmentation across entire video
+- **Segment Current Object in All Frames**: Propagate only the active object ID across the video
+- **Only segment forward from current frame**: Checkbox; when checked, the two propagation buttons
+  start at the current frame and skip earlier frames, leaving masks already computed for those
+  frames untouched
 
 #### Save Results
 - **Save Masks**: Export segmentation results as numpy arrays and visualization images

@@ -1,0 +1,11 @@
+python rotate_masks_back.py /mnt/disk4t/shaun/360roam-label/bar-rotated-mask /mnt/disk4t/shaun/360roam-label/bar-mask-filled --pole bottom --fill-holes --keep-largest --device cuda
+python rotate_masks_back.py /mnt/disk4t/shaun/360roam-label/base-rotated-mask /mnt/disk4t/shaun/360roam-label/base-mask-filled --pole bottom --fill-holes --keep-largest --device cuda
+python rotate_masks_back.py /mnt/disk4t/shaun/360roam-label/cafe-rotated-mask /mnt/disk4t/shaun/360roam-label/cafe-mask-filled --pole bottom --fill-holes --keep-largest --device cuda
+python rotate_masks_back.py /mnt/disk4t/shaun/360roam-label/canteen-rotated-mask /mnt/disk4t/shaun/360roam-label/canteen-mask-filled --pole bottom --fill-holes --keep-largest --device cuda
+python rotate_masks_back.py /mnt/disk4t/shaun/360roam-label/center-rotated-mask /mnt/disk4t/shaun/360roam-label/center-mask-filled --pole bottom --fill-holes --keep-largest --device cuda
+python rotate_masks_back.py /mnt/disk4t/shaun/360roam-label/center1-rotated-mask /mnt/disk4t/shaun/360roam-label/center1-mask-filled --pole bottom --fill-holes --keep-largest --device cuda
+python rotate_masks_back.py /mnt/disk4t/shaun/360roam-label/corridor-rotated-mask /mnt/disk4t/shaun/360roam-label/corridor-mask-filled --pole bottom --fill-holes --keep-largest --device cuda
+python rotate_masks_back.py /mnt/disk4t/shaun/360roam-label/innovation-rotated-mask /mnt/disk4t/shaun/360roam-label/innovation-mask-filled --pole bottom --fill-holes --keep-largest --device cuda
+python rotate_masks_back.py /mnt/disk4t/shaun/360roam-label/lab-rotated-mask /mnt/disk4t/shaun/360roam-label/lab-mask-filled --pole bottom --fill-holes --keep-largest --device cuda
+python rotate_masks_back.py /mnt/disk4t/shaun/360roam-label/library-rotated-mask /mnt/disk4t/shaun/360roam-label/library-mask-filled --pole bottom --fill-holes --keep-largest --device cuda
+python rotate_masks_back.py /mnt/disk4t/shaun/360roam-label/office-rotated-mask /mnt/disk4t/shaun/360roam-label/office-mask-filled --pole bottom --fill-holes --keep-largest --device cuda
