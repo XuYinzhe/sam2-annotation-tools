@@ -1,6 +1,9 @@
+import os
 import numpy as np
 import torch
 import torch.nn.functional as F
+from PIL import Image
+from scipy import ndimage
 
 
 def _rotation_x(angle):
@@ -152,3 +155,129 @@ def rotate_erp_image(img, target_lat, inverse=False, mode='bilinear',
     out = F.grid_sample(tensor, grid_t, mode=mode, padding_mode=padding_mode,
                         align_corners=True)
     return _postprocess_tensor(out, is_gray)
+
+
+def pole_to_target_lat(pole):
+    """Target latitude (radians) used to bring a pole to the ERP image center.
+
+    Direction convention: 'bottom' -> +pi/2, 'top' -> -pi/2.
+    """
+    return np.pi / 2 if pole == 'bottom' else -np.pi / 2
+
+
+def rotate_erp_image_fast(img, target_lat, inverse=False, mode='bilinear',
+                          padding_mode='border', device='cpu', grid=None):
+    """Same as rotate_erp_image, but accepts a precomputed grid.
+
+    The sampling grid depends only on the image size and rotation, so a caller
+    processing a sequence can compute it once and reuse it for every frame.
+    """
+    if grid is None:
+        grid = _compute_sample_grid(img.shape[0], img.shape[1], target_lat, inverse=inverse)
+    tensor, is_gray = _prepare_tensor(img, device)
+    grid_t = torch.from_numpy(grid).to(device).unsqueeze(0)
+    out = F.grid_sample(tensor, grid_t, mode=mode, padding_mode=padding_mode,
+                        align_corners=True)
+    return _postprocess_tensor(out, is_gray)
+
+
+def list_image_files(directory):
+    """Return the supported image filenames in a directory, sorted by name."""
+    exts = {'.jpg', '.jpeg', '.png', '.bmp', '.tiff', '.webp'}
+    files = [f for f in os.listdir(directory)
+             if os.path.splitext(f)[-1].lower() in exts]
+    files.sort()
+    return files
+
+
+def rotate_erp_frames_to_dir(input_dir, output_dir, target_lat, device='cpu',
+                             progress=None, jpg_quality=95):
+    """Rotate every image in input_dir and write 8-bit JPEGs to output_dir.
+
+    Output files keep the source stem (e.g. 000000.png -> 000000.jpg) so that
+    both the UI and SAM2 frame loaders (which sort by integer stem) agree on
+    the frame order.
+
+    Args:
+        progress: optional callable(done, total) invoked once per frame.
+        jpg_quality: JPEG quality for the written frames.
+
+    Returns the list of written file names.
+    """
+    files = list_image_files(input_dir)
+    if not files:
+        raise ValueError(f"No supported images found in {input_dir}")
+    os.makedirs(output_dir, exist_ok=True)
+
+    first = np.array(Image.open(os.path.join(input_dir, files[0])).convert('RGB'))
+    grid = _compute_sample_grid(first.shape[0], first.shape[1], target_lat, inverse=False)
+
+    written = []
+    total = len(files)
+    for i, fname in enumerate(files):
+        img = np.array(Image.open(os.path.join(input_dir, fname)).convert('RGB'))
+        rotated = rotate_erp_image_fast(img, target_lat, inverse=False,
+                                        mode='bilinear', padding_mode='border',
+                                        device=device, grid=grid)
+        rotated = np.clip(rotated, 0, 255).astype(np.uint8)
+        out_name = os.path.splitext(fname)[0] + '.jpg'
+        Image.fromarray(rotated).save(os.path.join(output_dir, out_name),
+                                      quality=jpg_quality)
+        written.append(out_name)
+        if progress is not None:
+            progress(i + 1, total)
+    return written
+
+
+def fill_mask_holes(mask):
+    """Fill interior holes of a binary mask."""
+    return ndimage.binary_fill_holes(mask > 0).astype(np.uint8)
+
+
+def keep_largest_component(mask):
+    """Keep only the largest connected component of a binary mask."""
+    binary = (mask > 0).astype(np.uint8)
+    labeled, num_features = ndimage.label(binary)
+    if num_features <= 1:
+        return binary
+    sizes = ndimage.sum(binary, labeled, range(1, num_features + 1))
+    largest_label = np.argmax(sizes) + 1
+    return (labeled == largest_label).astype(np.uint8)
+
+
+def remove_small_components(mask, min_area):
+    """Remove connected components smaller than min_area pixels."""
+    binary = (mask > 0).astype(np.uint8)
+    labeled, num_features = ndimage.label(binary)
+    if num_features <= 1:
+        return binary
+    sizes = ndimage.sum(binary, labeled, range(1, num_features + 1))
+    keep_labels = np.where(sizes >= min_area)[0] + 1
+    return np.isin(labeled, keep_labels).astype(np.uint8)
+
+
+def rotate_mask_back_to_erp(mask, target_lat, device='cpu', grid=None,
+                            threshold=0.0, fill_holes=True, keep_largest=False,
+                            min_area=None):
+    """Rotate one (H, W) mask from the pole-centered view back to ERP coords.
+
+    Mirrors the offline pipeline: fill holes in the rotated view, inverse
+    rotate (bilinear), binarize, then clean up connected components.
+    Returns a 0/1 uint8 mask in original ERP resolution.
+    """
+    binary = (np.asarray(mask) > 0).astype(np.uint8)
+    if fill_holes:
+        binary = fill_mask_holes(binary)
+    if binary.ndim == 3:
+        raise ValueError(f"Expected a single (H, W) mask, got shape {binary.shape}")
+
+    rotated = rotate_erp_image_fast(binary.astype(np.float32), target_lat,
+                                    inverse=True, mode='bilinear',
+                                    padding_mode='border', device=device, grid=grid)
+    out = (rotated > threshold).astype(np.uint8)
+
+    if keep_largest:
+        out = keep_largest_component(out)
+    elif min_area is not None and min_area > 0:
+        out = remove_small_components(out, min_area)
+    return out

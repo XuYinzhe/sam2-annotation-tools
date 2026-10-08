@@ -1,4 +1,6 @@
 import os
+import gc
+import shutil
 import sys
 import time
 import numpy as np
@@ -9,10 +11,17 @@ from matplotlib.figure import Figure
 from PIL import Image
 from PyQt5.QtWidgets import (QApplication, QMainWindow, QPushButton, QVBoxLayout, QHBoxLayout, 
                              QLabel, QLineEdit, QWidget, QFileDialog, QSpinBox, QGroupBox, QRadioButton,
-                             QCheckBox, QShortcut)
+                             QCheckBox, QShortcut, QMessageBox)
 from PyQt5.QtCore import Qt, QTimer
 from PyQt5.QtGui import QKeySequence
 from sam2.build_sam import build_sam2_video_predictor
+
+from erp_rotation import (pole_to_target_lat, rotate_erp_frames_to_dir,
+                          rotate_mask_back_to_erp)
+
+
+ERP_ROTATED_SUFFIX = ".erp_rotated"
+ERP_MASK_CLEANUP = dict(fill_holes=True, keep_largest=True, min_area=None)
 
 
 class MplCanvas(FigureCanvas):
@@ -36,7 +45,8 @@ class SAM2AnnotationTool(QMainWindow):
         plt.rcParams['agg.path.chunksize'] = 10000
         
         # Initialize variables
-        self.data_dir = ""
+        self.data_dir = ""      # source ERP directory, also the base for save paths
+        self.active_dir = ""    # directory currently displayed / loaded by SAM2 (rotated cache or source)
         self.frame_names = []
         self.current_frame_idx = 0
         self.inference_state = None
@@ -46,6 +56,14 @@ class SAM2AnnotationTool(QMainWindow):
         self.video_segments = {}
         self.point_mode = "positive"  # Default mode for point adding
         self.add_point_mode = False   # Flag for adding points mode
+
+        # ERP pole-rotation state
+        self.erp_pole = None            # None = disabled; 'bottom'/'top' = rotate that pole to the center
+        self.erp_cache_dir = None       # rotated-frame cache currently in use
+        self.erp_caches = {}            # pole -> cache dir, everything created this session (removed on exit)
+        self.erp_rotating = False       # guard while a rotation pass is running
+        self._source_files = None       # cached listing of the source ERP directory
+        self._inference_dir = None      # directory the current SAM2 state was built from
         
         # Add storage for each object ID's prompts
         self.object_prompts = {
@@ -117,6 +135,16 @@ class SAM2AnnotationTool(QMainWindow):
         self.save_path_input = QLineEdit()
         path_layout.addWidget(QLabel("Save Subfolder: (default: masks)"))
         path_layout.addWidget(self.save_path_input)
+        
+        self.erp_rotate_checkbox = QCheckBox("Rotate bottom pole to equator (360 ERP)")
+        self.erp_rotate_checkbox.setToolTip(
+            "Load the sequence with the bottom pole rotated to the image center, "
+            "so pole-area objects (camera operator, stick, cart) can be annotated "
+            "without ERP distortion. Masks are rotated back to the original ERP "
+            "coordinates and cleaned (fill holes + keep largest component) when saved."
+        )
+        self.erp_rotate_checkbox.toggled.connect(self.on_erp_rotate_toggled)
+        path_layout.addWidget(self.erp_rotate_checkbox)
         
         path_group.setLayout(path_layout)
         left_layout.addWidget(path_group)
@@ -236,6 +264,14 @@ class SAM2AnnotationTool(QMainWindow):
         )
         segment_layout.addWidget(self.forward_only_checkbox)
         
+        self.clear_current_obj_button = QPushButton("Clear Current Object From Current Frame")
+        self.clear_current_obj_button.setToolTip(
+            "Delete the current object's masks and prompts on this frame and all later frames. "
+            "Data on earlier frames is kept."
+        )
+        self.clear_current_obj_button.clicked.connect(self.clear_current_object_from_current_frame)
+        segment_layout.addWidget(self.clear_current_obj_button)
+        
         segment_group.setLayout(segment_layout)
         left_layout.addWidget(segment_group)
         
@@ -326,9 +362,23 @@ class SAM2AnnotationTool(QMainWindow):
         # Update save controls
         has_segments = len(self.video_segments) > 0
         has_current_obj_segments = any(self.ann_obj_id in obj_masks for obj_masks in self.video_segments.values())
+        has_current_obj_segments_from_current = any(
+            self.ann_obj_id in obj_masks
+            for frame_idx, obj_masks in self.video_segments.items()
+            if frame_idx >= self.current_frame_idx
+        )
+        has_current_obj_prompts_from_current = any(
+            frame_idx >= self.current_frame_idx
+            and (prompts['box'] is not None or len(prompts['points']) > 0)
+            for frame_idx, prompts in self.object_prompts.get(self.ann_obj_id, {}).items()
+        )
         self.save_button.setEnabled(has_segments and not self.animation_playing)
         self.save_binary_button.setEnabled(has_segments and not self.animation_playing)
         self.save_current_obj_binary_button.setEnabled(has_current_obj_segments and not self.animation_playing)
+        self.clear_current_obj_button.setEnabled(
+            (has_current_obj_segments_from_current or has_current_obj_prompts_from_current)
+            and not self.animation_playing
+        )
     
     def update_object_id(self):
         self.ann_obj_id = self.obj_id_spinbox.value()
@@ -353,18 +403,173 @@ class SAM2AnnotationTool(QMainWindow):
             self.path_input.setText(directory)
             self.load_frames(directory)
     
-    def load_frames(self, directory):
+    def on_erp_rotate_toggled(self, checked):
+        if self.erp_rotating:
+            return
+        # Reloading the sequence discards prompts and masks, so confirm first
+        source = self.data_dir or self.path_input.text().strip()
+        if source and os.path.isdir(source) and self._has_annotation_work():
+            what = "enable" if checked else "disable"
+            answer = QMessageBox.question(
+                self, "Reload sequence?",
+                f"To {what} ERP pole rotation the sequence will be reloaded, "
+                "which discards all current points and masks.\n\nContinue?",
+                QMessageBox.Yes | QMessageBox.No, QMessageBox.No,
+            )
+            if answer != QMessageBox.Yes:
+                self.erp_rotate_checkbox.blockSignals(True)
+                self.erp_rotate_checkbox.setChecked(not checked)
+                self.erp_rotate_checkbox.blockSignals(False)
+                return
+        
+        if checked:
+            self.erp_pole = 'bottom'
+            self.status_label.setText("ERP pole rotation enabled: bottom pole to equator")
+        else:
+            self.erp_pole = None
+            self.status_label.setText("ERP pole rotation disabled")
+        # Reload the current directory so the new view takes effect
+        if source and os.path.isdir(source):
+            if self.erp_pole:
+                self.path_input.setText(source)
+            self.load_frames(source)
+    
+    def _has_annotation_work(self):
+        """True if the session holds points, boxes or masks that a reload would discard."""
+        if self.video_segments:
+            return True
+        for obj_prompts in self.object_prompts.values():
+            for prompts in obj_prompts.values():
+                if prompts.get('box') is not None or prompts.get('points'):
+                    return True
+        return False
+    
+    def _erp_rotated_cache_dir(self, source_dir):
+        """Sibling directory holding the pole-rotated frames of source_dir."""
+        return os.path.normpath(source_dir) + ERP_ROTATED_SUFFIX
+    
+    def _build_erp_rotated_frames(self, source_dir, cache_dir):
+        """Rotate every frame of source_dir into cache_dir (JPEG, original stems)."""
+        self.erp_rotating = True
+        self.erp_rotate_checkbox.setEnabled(False)
         try:
+            target_lat = pole_to_target_lat(self.erp_pole)
+            total = 0
+    
+            def report(done, total_count):
+                nonlocal total
+                total = total_count
+                if done == total_count or done % 25 == 0:
+                    self.status_label.setText(
+                        f"Rotating frames (pole {self.erp_pole} to equator): "
+                        f"{done}/{total_count}..."
+                    )
+                    QApplication.processEvents()
+    
+            rotate_erp_frames_to_dir(source_dir, cache_dir, target_lat,
+                                     device=str(self.device), progress=report)
+            self.erp_caches[self.erp_pole] = (cache_dir, source_dir)
+            self.status_label.setText(
+                f"Rotated {total} frames to ERP pole-centered view"
+            )
+            return True
+        except Exception as e:
+            self.status_label.setText(f"Error rotating ERP frames: {str(e)}")
+            return False
+        finally:
+            self.erp_rotating = False
+            self.erp_rotate_checkbox.setEnabled(True)
+    
+    def _has_erp_cache(self, pole, cache_dir, source_dir):
+        """True if a cache built earlier this session still matches pole and source."""
+        entry = self.erp_caches.get(pole) if pole else None
+        return bool(entry) and entry == (cache_dir, source_dir)
+    
+    @staticmethod
+    def _remove_erp_cache(cache_dir):
+        """Delete a rotated-frame cache directory (never touches the source directory)."""
+        try:
+            shutil.rmtree(cache_dir)
+        except FileNotFoundError:
+            pass
+        except OSError as e:
+            print(f"Could not remove rotated frame cache {cache_dir}: {e}")
+    
+    def _detach_video_segments(self):
+        """Copy numpy mask arrays out of view of the soon-to-be-replaced inference state."""
+        self.video_segments = {
+            frame_idx: {obj_id: np.array(mask, copy=True) for obj_id, mask in obj_masks.items()}
+            for frame_idx, obj_masks in self.video_segments.items()
+        }
+    
+    def _release_inference_state(self):
+        """Free the GPU memory held by the current SAM2 inference state.
+    
+        init_state() encodes every frame onto the GPU, so the old state must be
+        dropped before a new one is created, otherwise the peak doubles and can
+        run out of memory. Safe to call when no state exists.
+        """
+        old_state = self.inference_state
+        if old_state is None:
+            return
+        self._detach_video_segments()
+        self.inference_state = None
+        self._inference_dir = None
+        try:
+            self.predictor.reset_state(old_state)
+        except Exception as e:
+            print(f"Could not reset previous inference state: {e}")
+        del old_state
+        gc.collect()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+    
+    def load_frames(self, directory, reload_view=True):
+        """Load a frame sequence.
+        
+        reload_view=False keeps the current view directory (i.e. the images are
+        identical to what is already loaded), skipping any GPU work.
+        """
+        try:
+            directory = os.path.normpath(directory)
+            active_dir = directory
+            cache_dir = None
+            if self.erp_pole:
+                cache_dir = self._erp_rotated_cache_dir(directory)
+                if self._has_erp_cache(self.erp_pole, cache_dir, directory):
+                    active_dir = cache_dir  # built earlier this session, reuse it
+                else:
+                    # Switching source/pole: drop whatever this pole had cached before
+                    old_entry = self.erp_caches.get(self.erp_pole)
+                    if old_entry:
+                        self._remove_erp_cache(old_entry[0])
+                    self._remove_erp_cache(cache_dir)  # clear leftovers from a previous run
+                    if not self._build_erp_rotated_frames(directory, cache_dir):
+                        return
+                    active_dir = cache_dir
+
+            if not reload_view and active_dir == self.active_dir:
+                return  # nothing to do, the same frames are already loaded
+
             self.data_dir = directory
+            self.path_input.setText(directory)
             # Get only image files
-            self.frame_names = [
-                p for p in os.listdir(directory)
+            new_frame_names = [
+                p for p in os.listdir(active_dir)
                 if os.path.splitext(p)[-1].lower() in [".jpg", ".jpeg", ".png"]
             ]
             
-            if not self.frame_names:
+            if not new_frame_names:
                 self.status_label.setText("No image files found in the selected directory")
                 return
+            
+            # The new sequence is usable only now, so commit the rotation state here
+            same_sequence = (active_dir == self._inference_dir
+                             and sorted(new_frame_names) == sorted(self.frame_names))
+            self.frame_names = new_frame_names
+            self.active_dir = active_dir
+            self.erp_cache_dir = cache_dir
+            self._source_files = None
             
             # Sort frames by number
             self.frame_names.sort()
@@ -377,10 +582,24 @@ class SAM2AnnotationTool(QMainWindow):
             # Clear frame cache
             self.frame_cache = {}
             
-            # Initialize inference state
+            # Initialize inference state. The previous state holds all previously
+            # loaded frames on the GPU, so drop it before loading the new sequence,
+            # otherwise both sets of encoded frames coexist and double the peak.
             if self.predictor:
-                self.inference_state = self.predictor.init_state(video_path=directory)
-                self.predictor.reset_state(self.inference_state)
+                if same_sequence and self.inference_state is not None:
+                    print(f"SAM2 state kept: {len(self.frame_names)} frames already loaded")
+                else:
+                    if torch.cuda.is_available():
+                        torch.cuda.reset_peak_memory_stats()
+                    self._release_inference_state()
+                    new_state = self.predictor.init_state(video_path=self.active_dir)
+                    self.inference_state = new_state
+                    self._inference_dir = active_dir
+                    self.predictor.reset_state(new_state)
+                    if torch.cuda.is_available():
+                        print(f"SAM2 state loaded: {len(self.frame_names)} frames, "
+                              f"GPU peak {torch.cuda.max_memory_allocated() / 1e9:.2f} GB "
+                              f"(reserved {torch.cuda.memory_reserved() / 1e9:.2f} GB)")
             self.ann_obj_id = 0  # Start from 0
             self.obj_id_spinbox.setValue(0)
             self.object_prompts = {0: {0: {'points': [], 'labels': [], 'box': None}}}
@@ -392,7 +611,13 @@ class SAM2AnnotationTool(QMainWindow):
             
             # Display first frame
             self.display_current_frame()
-            self.status_label.setText(f"Loaded {len(self.frame_names)} frames")
+            if self.erp_pole:
+                self.status_label.setText(
+                    f"Loaded {len(self.frame_names)} frames (bottom pole rotated to equator); "
+                    "masks will be rotated back to ERP coordinates on save"
+                )
+            else:
+                self.status_label.setText(f"Loaded {len(self.frame_names)} frames")
             
         except Exception as e:
             self.status_label.setText(f"Error loading frames: {str(e)}")
@@ -404,7 +629,7 @@ class SAM2AnnotationTool(QMainWindow):
         for idx in range(start_idx, min(end_idx, len(self.frame_names))):
             if idx not in self.frame_cache:
                 try:
-                    frame_path = os.path.join(self.data_dir, self.frame_names[idx])
+                    frame_path = os.path.join(self.active_dir, self.frame_names[idx])
                     img = Image.open(frame_path)
                     self.frame_cache[idx] = img
                     
@@ -421,7 +646,7 @@ class SAM2AnnotationTool(QMainWindow):
         """Get frame from cache, load if not present"""
         if idx not in self.frame_cache:
             try:
-                frame_path = os.path.join(self.data_dir, self.frame_names[idx])
+                frame_path = os.path.join(self.active_dir, self.frame_names[idx])
                 img = Image.open(frame_path)
                 self.frame_cache[idx] = img
                 
@@ -435,6 +660,25 @@ class SAM2AnnotationTool(QMainWindow):
                 return None
         
         return self.frame_cache[idx]
+    
+    def get_source_frame(self, idx):
+        """Load a frame from the original ERP directory (for mask visualization after rotate-back).
+
+        The source directory may use different extensions than the rotated cache,
+        so match frames by position in the sorted listing instead of by name.
+        """
+        try:
+            if self._source_files is None:
+                self._source_files = [
+                    p for p in sorted(os.listdir(self.data_dir))
+                    if os.path.splitext(p)[-1].lower() in [".jpg", ".jpeg", ".png"]
+                ]
+            if idx >= len(self._source_files):
+                return None
+            return Image.open(os.path.join(self.data_dir, self._source_files[idx]))
+        except Exception as e:
+            print(f"Error loading source frame {idx}: {e}")
+            return None
     
     def display_current_frame(self):
         if not self.frame_names or self.current_frame_idx >= len(self.frame_names):
@@ -878,6 +1122,81 @@ class SAM2AnnotationTool(QMainWindow):
         
         self.update_ui_state()
     
+    def clear_current_object_from_current_frame(self):
+        """Delete the current object's masks and prompts on the current frame and all later frames."""
+        obj_id = self.ann_obj_id
+        mask_frames = sorted(
+            frame_idx
+            for frame_idx, obj_masks in self.video_segments.items()
+            if frame_idx >= self.current_frame_idx and obj_id in obj_masks
+        )
+        prompt_frames = [
+            frame_idx
+            for frame_idx, prompts in self.object_prompts.get(obj_id, {}).items()
+            if frame_idx >= self.current_frame_idx
+        ]
+        non_empty_prompt_frames = [
+            frame_idx for frame_idx in prompt_frames
+            if self.object_prompts[obj_id][frame_idx]['box'] is not None
+            or self.object_prompts[obj_id][frame_idx]['points']
+        ]
+        if not mask_frames and not non_empty_prompt_frames:
+            self.status_label.setText(
+                f"Object {obj_id} has no masks or prompts from frame {self.current_frame_idx} onward"
+            )
+            return
+        
+        details = []
+        if mask_frames:
+            details.append(f"{len(mask_frames)} masks")
+        if non_empty_prompt_frames:
+            details.append(f"{len(non_empty_prompt_frames)} prompt frames")
+        details_text = " and ".join(details)
+        first_frame = min(mask_frames + non_empty_prompt_frames)
+        last_frame = max(mask_frames + non_empty_prompt_frames)
+        
+        answer = QMessageBox.question(
+            self, "Clear object data?",
+            f"Delete object {obj_id}'s {details_text} on frames {first_frame}-{last_frame}?\n\n"
+            "Data on earlier frames is kept.",
+            QMessageBox.Yes | QMessageBox.No, QMessageBox.No,
+        )
+        if answer != QMessageBox.Yes:
+            return
+        
+        for frame_idx in mask_frames:
+            del self.video_segments[frame_idx][obj_id]
+            if not self.video_segments[frame_idx]:
+                del self.video_segments[frame_idx]
+        for frame_idx in prompt_frames:
+            del self.object_prompts[obj_id][frame_idx]
+        
+        self.status_label.setText(
+            f"Cleared object {obj_id}'s {details_text} on frames {first_frame}-{last_frame}"
+        )
+        self.display_current_frame()
+        self.update_ui_state()
+    
+    def _mask_for_saving(self, mask, frame_idx, obj_id):
+        """Normalize a mask to a single (H, W) binary map, rotating it back to ERP
+        coordinates when pole rotation is active."""
+        mask = np.asarray(mask)
+        if mask.ndim > 2:
+            mask = mask.squeeze()
+            if mask.ndim == 1:
+                mask = mask[np.newaxis, :]
+        if mask.ndim != 2:
+            raise ValueError(f"unexpected mask shape for frame {frame_idx}, obj {obj_id}: {mask.shape}")
+
+        binary = (mask > 0).astype(np.uint8)
+        if not self.erp_pole:
+            return binary
+
+        return rotate_mask_back_to_erp(
+            binary, target_lat=pole_to_target_lat(self.erp_pole),
+            device=str(self.device), threshold=0.0, **ERP_MASK_CLEANUP,
+        )
+    
     def save_masks(self):
         if not self.video_segments:
             return
@@ -891,7 +1210,10 @@ class SAM2AnnotationTool(QMainWindow):
         parent_dir = os.path.dirname(os.path.normpath(self.data_dir))
         save_dir = os.path.join(parent_dir, subfolder)
         os.makedirs(save_dir, exist_ok=True)
-        vis_dir = save_dir.replace(subfolder, "masks_vis")
+        if subfolder == "masks":
+            vis_dir = os.path.join(parent_dir, "masks_vis")
+        else:
+            vis_dir = os.path.join(parent_dir, f"{subfolder}_vis")
         os.makedirs(vis_dir, exist_ok=True)
         
         # Save masks as numpy arrays
@@ -901,13 +1223,17 @@ class SAM2AnnotationTool(QMainWindow):
             frame_name = os.path.splitext(self.frame_names[frame_idx])[0]
             masks = []
             for obj_id, mask in obj_masks.items():
-                masks.append(mask)
+                masks.append(self._mask_for_saving(mask, frame_idx, obj_id))
             masks = np.stack(masks, axis=0) # (num_masks, H, W)
             save_path = os.path.join(save_dir, f"{frame_name}.npy")
             np.save(save_path, masks)
 
-            # visualize the masks
-            img = np.array(self.frame_cache[frame_idx])
+            # visualize the masks over the frame they belong to (rotated or original view)
+            if self.erp_pole:
+                img = self.get_source_frame(frame_idx)
+                img = np.array(img) if img is not None else np.array(self.frame_cache[frame_idx])
+            else:
+                img = np.array(self.frame_cache[frame_idx])
             if masks.sum() == 0:
                 vis_mask = img
             else:
@@ -948,15 +1274,11 @@ class SAM2AnnotationTool(QMainWindow):
         for frame_idx, obj_masks in self.video_segments.items():
             frame_name = os.path.splitext(self.frame_names[frame_idx])[0]
             for obj_id, mask in obj_masks.items():
-                mask = np.asarray(mask)
-                if mask.ndim > 2:
-                    mask = mask.squeeze()
-                    if mask.ndim == 1:
-                        mask = mask[np.newaxis, :]
-                if mask.ndim != 2:
-                    print(f"Warning: unexpected mask shape for frame {frame_idx}, obj {obj_id}: {mask.shape}")
+                try:
+                    binary_mask = self._mask_for_saving(mask, frame_idx, obj_id) * 255
+                except ValueError as e:
+                    print(f"Warning: {e}")
                     continue
-                binary_mask = (mask.astype(np.uint8)) * 255
                 save_path = os.path.join(binary_save_dir, f"{frame_name}_obj_{obj_id}.png")
                 Image.fromarray(binary_mask).save(save_path)
                 saved_count += 1
@@ -988,16 +1310,11 @@ class SAM2AnnotationTool(QMainWindow):
             if current_obj_id not in obj_masks:
                 continue
             frame_name = os.path.splitext(self.frame_names[frame_idx])[0]
-            mask = obj_masks[current_obj_id]
-            mask = np.asarray(mask)
-            if mask.ndim > 2:
-                mask = mask.squeeze()
-                if mask.ndim == 1:
-                    mask = mask[np.newaxis, :]
-            if mask.ndim != 2:
-                print(f"Warning: unexpected mask shape for frame {frame_idx}, obj {current_obj_id}: {mask.shape}")
+            try:
+                binary_mask = self._mask_for_saving(obj_masks[current_obj_id], frame_idx, current_obj_id) * 255
+            except ValueError as e:
+                print(f"Warning: {e}")
                 continue
-            binary_mask = (mask.astype(np.uint8)) * 255
             save_path = os.path.join(binary_save_dir, f"{frame_name}_obj_{current_obj_id}.png")
             Image.fromarray(binary_mask).save(save_path)
             saved_count += 1
@@ -1058,6 +1375,12 @@ class SAM2AnnotationTool(QMainWindow):
         # Stop animation timer when closing the application
         if self.animation_timer.isActive():
             self.animation_timer.stop()
+        # Free the GPU frames held by SAM2 before shutting down
+        self._release_inference_state()
+        # Remove every rotated-frame cache this session created
+        for cache_dir, _source in self.erp_caches.values():
+            self._remove_erp_cache(cache_dir)
+        self.erp_caches.clear()
         # Clean up resources
         self.frame_cache.clear()
         event.accept()

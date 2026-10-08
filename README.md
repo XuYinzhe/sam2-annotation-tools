@@ -45,6 +45,9 @@ Here is a [demo video](./use_case.mp4).
 - **Segment Current Frame**: Generate mask for current frame only
 - **Segment All Frames**: Propagate segmentation across entire video
 - **Segment Current Object in All Frames**: Propagate only the active object ID across the video
+- **Clear Current Object From Current Frame**: Delete the active object's masks and prompts on the
+  current frame and all later frames (earlier frames are kept), useful when
+  propagation drifts and the object must be re-segmented from a given frame onward
 - **Only segment forward from current frame**: Checkbox; when checked, the two propagation buttons
   start at the current frame and skip earlier frames, leaving masks already computed for those
   frames untouched
